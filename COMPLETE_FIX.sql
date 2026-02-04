@@ -1,0 +1,417 @@
+-- ===========================================
+-- COMPLETE FIX FOR SCHEDULE/CHAPTER SYSTEM
+-- Run this entire file in Supabase SQL Editor
+-- ===========================================
+
+-- PART 1: Fix the trigger to use 1 chapter = 1 class formula
+-- ===========================================
+
+DROP TRIGGER IF EXISTS trg_subscription_json ON mentor.subscriptions;
+
+CREATE OR REPLACE FUNCTION mentor.fn_generate_schedule_json()
+RETURNS TRIGGER AS $$
+DECLARE
+    day_codes TEXT[];
+    day_code TEXT;
+    day_name TEXT;
+    day_names TEXT[] := ARRAY[]::TEXT[];
+    subj_codes TEXT[];
+    subj_code TEXT;
+    subj_name TEXT;
+    subject_names TEXT[] := ARRAY[]::TEXT[];
+    subject_chapters INT[] := ARRAY[]::INT[];
+    subject_current_ch INT[] := ARRAY[]::INT[];
+    chapters INT;
+    total_classes_count INT := 0;
+    schedule_array JSONB := '[]'::JSONB;
+    current_date_val DATE;
+    subject_index INT := 1;
+    class_number INT := 1;
+    i INT;
+BEGIN
+    -- Convert day codes to names if needed
+    day_codes := string_to_array(NEW.schedule_days, ',');
+    
+    FOREACH day_code IN ARRAY day_codes LOOP
+        day_code := trim(day_code);
+        IF day_code ~ '^[0-9]+$' THEN
+            SELECT name INTO day_name FROM mentor.days_ref WHERE code = day_code::INT;
+            IF day_name IS NOT NULL THEN
+                day_names := array_append(day_names, day_name);
+            END IF;
+        ELSE
+            day_names := array_append(day_names, day_code);
+        END IF;
+    END LOOP;
+    
+    IF array_length(day_names, 1) > 0 THEN
+        NEW.schedule_days := array_to_string(day_names, ',');
+    END IF;
+    
+    -- Process subjects
+    subj_codes := string_to_array(NEW.subjects, ',');
+    subject_names := ARRAY[]::TEXT[];
+    subject_chapters := ARRAY[]::INT[];
+    subject_current_ch := ARRAY[]::INT[];
+    
+    FOREACH subj_code IN ARRAY subj_codes LOOP
+        subj_code := trim(subj_code);
+        IF subj_code = '' THEN
+            CONTINUE;
+        END IF;
+        
+        IF subj_code ~ '^[0-9]+$' THEN
+            SELECT name INTO subj_name FROM mentor.subjects_ref WHERE code = subj_code::INT;
+        ELSE
+            subj_name := subj_code;
+        END IF;
+        
+        IF subj_name IS NOT NULL THEN
+            subject_names := array_append(subject_names, subj_name);
+            
+            -- Look up chapters (case-insensitive)
+            SELECT total_chapters INTO chapters
+            FROM mentor.chapters
+            WHERE class = NEW.class AND LOWER(subject) = LOWER(subj_name);
+            
+            IF chapters IS NULL THEN
+                chapters := 15; -- Default
+            END IF;
+            
+            subject_chapters := array_append(subject_chapters, chapters);
+            subject_current_ch := array_append(subject_current_ch, 1);
+            
+            -- NEW FORMULA: 1 chapter = 1 class
+            total_classes_count := total_classes_count + chapters;
+        END IF;
+    END LOOP;
+    
+    IF array_length(subject_names, 1) > 0 THEN
+        NEW.subjects := array_to_string(subject_names, ',');
+    END IF;
+    
+    NEW.total_classes := total_classes_count;
+    
+    -- Generate schedule JSON (1 class per chapter)
+    current_date_val := COALESCE(NEW.start_date, CURRENT_DATE);
+    subject_index := 1;
+    
+    WHILE class_number <= total_classes_count AND class_number <= 500 LOOP
+        i := ((subject_index - 1) % GREATEST(array_length(subject_names, 1), 1)) + 1;
+        
+        IF subject_current_ch[i] <= subject_chapters[i] THEN
+            schedule_array := schedule_array || jsonb_build_object(
+                'class_num', class_number,
+                'date', current_date_val::TEXT,
+                'subject', subject_names[i],
+                'chapter', subject_current_ch[i],
+                'part', 1,
+                'done', false
+            );
+            
+            subject_current_ch[i] := subject_current_ch[i] + 1;
+            class_number := class_number + 1;
+        END IF;
+        
+        subject_index := subject_index + 1;
+        
+        IF array_length(subject_names, 1) IS NOT NULL AND subject_index > array_length(subject_names, 1) THEN
+            subject_index := 1;
+            current_date_val := current_date_val + 1;
+        END IF;
+    END LOOP;
+    
+    NEW.schedule_json := jsonb_build_object(
+        'total_classes', total_classes_count,
+        'subjects', subject_names,
+        'days', day_names,
+        'generated_at', CURRENT_TIMESTAMP,
+        'classes', schedule_array
+    );
+    
+    IF total_classes_count > 0 THEN
+        NEW.progress_percent := ROUND((NEW.completed_classes::DECIMAL / total_classes_count) * 100, 2);
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Trigger fires on BOTH INSERT and UPDATE
+CREATE TRIGGER trg_subscription_json
+BEFORE INSERT OR UPDATE ON mentor.subscriptions
+FOR EACH ROW
+EXECUTE FUNCTION mentor.fn_generate_schedule_json();
+
+
+-- PART 2: Update chapter counts with accurate data from class-content folders
+-- ===========================================
+
+DELETE FROM mentor.chapters;
+
+-- Class 1
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(1, 'English for Today', 39),
+(1, 'আমার বাংলা বই', 54),
+(1, 'প্রাথমিক গণিত', 18);
+
+-- Class 2
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(2, 'English for Today', 51),
+(2, 'আমার বাংলা বই', 29),
+(2, 'প্রাথমিক গণিত', 22);
+
+-- Class 3
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(3, 'English For Today', 41),
+(3, 'আমার বাংলা বই', 29),
+(3, 'ইসলাম শিক্ষা', 5),
+(3, 'খ্রিস্টধর্ম শিক্ষা', 36),
+(3, 'প্রাথমিক গণিত', 13),
+(3, 'প্রাথমিক বিজ্ঞান', 11),
+(3, 'বাংলাদেশ ও বিশ্বপরিচয়', 12),
+(3, 'বৌদ্ধধর্ম শিক্ষা', 9),
+(3, 'হিন্দুধর্ম শিক্ষা', 20);
+
+-- Class 4
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(4, 'English For Today', 18),
+(4, 'আমার বাংলা বই', 23),
+(4, 'ইসলাম শিক্ষা', 31),
+(4, 'খ্রিস্টধর্ম শিক্ষা', 41),
+(4, 'প্রাথমিক গণিত', 11),
+(4, 'প্রাথমিক বিজ্ঞান', 11),
+(4, 'বাংলাদেশ ও বিশ্বপরিচয়', 14),
+(4, 'বৌদ্ধধর্ম শিক্ষা', 5),
+(4, 'হিন্দুধর্ম শিক্ষা', 17);
+
+-- Class 5
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(5, 'English For Today', 20),
+(5, 'আমার বাংলা বই', 23),
+(5, 'ইসলাম শিক্ষা', 33),
+(5, 'খ্রিস্টধর্ম শিক্ষা', 42),
+(5, 'প্রাথমিক গণিত', 10),
+(5, 'প্রাথমিক বিজ্ঞান', 13),
+(5, 'বাংলাদেশ ও বিশ্বপরিচয়', 16),
+(5, 'বৌদ্ধধর্ম শিক্ষা', 5),
+(5, 'হিন্দুধর্ম শিক্ষা', 15);
+
+-- Class 6
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(6, 'English For Today', 33),
+(6, 'English Grammar and Composition', 10),
+(6, 'আনন্দপাঠ', 10),
+(6, 'ইসলাম শিক্ষা', 54),
+(6, 'কর্ম ও জীবনমুখী শিক্ষা', 3),
+(6, 'কৃষিশিক্ষা', 6),
+(6, 'ক্ষুদ্র নৃগোষ্ঠীর ভাষা ও সংস্কৃতি', 6),
+(6, 'খ্রিষ্টধর্ম শিক্ষা', 10),
+(6, 'গণিত', 8),
+(6, 'গার্হস্থ্যবিজ্ঞান', 15),
+(6, 'চারু ও কারুকলা', 7),
+(6, 'চারুপাঠ', 20),
+(6, 'তথ্য ও যোগাযোগ প্রযুক্তি', 5),
+(6, 'পালি', 12),
+(6, 'বাংলা ব্যাকরণ ও নির্মিতি', 14),
+(6, 'বাংলাদেশ ও বিশ্বপরিচয়', 8),
+(6, 'বিজ্ঞান', 14),
+(6, 'বৌদ্ধধর্ম শিক্ষা', 11),
+(6, 'শারীরিক শিক্ষা ও স্বাস্থ্য', 5),
+(6, 'সংগীত', 7),
+(6, 'সংস্কৃত', 20),
+(6, 'সচিত্র আরবি পাঠ', 5),
+(6, 'হিন্দুধর্ম শিক্ষা', 8);
+
+-- Class 7
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(7, 'English For Today', 9),
+(7, 'English Grammar and Composition', 19),
+(7, 'আনন্দপাঠ', 9),
+(7, 'ইসলাম শিক্ষা', 5),
+(7, 'কর্ম ও জীবনমুখী শিক্ষা', 3),
+(7, 'কৃষিশিক্ষা', 6),
+(7, 'ক্ষুদ্র নৃগোষ্ঠীর ভাষা ও সংস্কৃতি', 6),
+(7, 'খ্রিষ্টধর্ম শিক্ষা', 10),
+(7, 'গণিত', 11),
+(7, 'গার্হস্থ্যবিজ্ঞান', 15),
+(7, 'চারু ও কারুকলা', 7),
+(7, 'তথ্য ও যোগাযোগ প্রযুক্তি', 5),
+(7, 'পালি', 10),
+(7, 'বাংলা ব্যাকরণ ও নির্মিতি', 35),
+(7, 'বাংলাদেশ ও বিশ্বপরিচয়', 11),
+(7, 'বিজ্ঞান', 14),
+(7, 'বৌদ্ধধর্ম শিক্ষা', 11),
+(7, 'শারীরিক শিক্ষা ও স্বাস্থ্য', 5),
+(7, 'সংগীত', 7),
+(7, 'সংস্কৃত', 19),
+(7, 'সপ্তবর্ণা', 18),
+(7, 'সহজ আরবি পাঠ', 12),
+(7, 'হিন্দুধর্ম শিক্ষা', 8);
+
+-- Class 8
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(8, 'English For Today', 11),
+(8, 'English Grammar and Composition', 15),
+(8, 'আনন্দপাঠ', 9),
+(8, 'ইসলাম শিক্ষা', 63),
+(8, 'কর্ম ও জীবনমুখী শিক্ষা', 3),
+(8, 'কৃষিশিক্ষা', 6),
+(8, 'খ্রিষ্টধর্ম শিক্ষা', 10),
+(8, 'গণিত', 11),
+(8, 'গার্হস্থ্যবিজ্ঞান', 14),
+(8, 'চারু ও কারুকলা', 8),
+(8, 'তথ্য ও যোগাযোগ প্রযুক্তি', 5),
+(8, 'পালি', 16),
+(8, 'বাংলা ব্যাকরণ ও নির্মিতি', 15),
+(8, 'বাংলাদেশ ও বিশ্বপরিচয়', 13),
+(8, 'বিজ্ঞান', 14),
+(8, 'বৌদ্ধধর্ম শিক্ষা', 11),
+(8, 'শারীরিক শিক্ষা ও স্বাস্থ্য', 4),
+(8, 'সংগীত', 7),
+(8, 'সংস্কৃত', 26),
+(8, 'সহজ আরবি পাঠ', 13),
+(8, 'সাহিত্য-কণিকা', 24),
+(8, 'হিন্দুধর্ম শিক্ষা', 8);
+
+-- Class 9
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(9, 'English For Today', 16),
+(9, 'English Grammar and Composition', 21),
+(9, 'অর্থনীতি', 10),
+(9, 'আরবি', 58),
+(9, 'ইসলাম শিক্ষা', 92),
+(9, 'উচ্চতর গণিত', 14),
+(9, 'কৃষিশিক্ষা', 7),
+(9, 'ক্যারিয়ার শিক্ষা', 4),
+(9, 'খ্রিষ্টধর্ম শিক্ষা', 15),
+(9, 'গণিত', 17),
+(9, 'গার্হস্থ্যবিজ্ঞান', 18),
+(9, 'চারু ও কারুকলা', 7),
+(9, 'জীববিজ্ঞান', 14),
+(9, 'তথ্য ও যোগাযোগ প্রযুক্তি', 6),
+(9, 'পদার্থবিজ্ঞান', 13),
+(9, 'পালি', 15),
+(9, 'পৌরনীতি ও নাগরিকতা', 10),
+(9, 'ফিন্যান্স ও ব্যাংকিং', 13),
+(9, 'বাংলা ভাষার ব্যাকরণ ও নির্মিতি', 83),
+(9, 'বাংলা সহপাঠ', 8),
+(9, 'বাংলা সাহিত্য', 50),
+(9, 'বাংলাদেশ ও বিশ্বপরিচয়', 15),
+(9, 'বাংলাদেশের ইতিহাস ও বিশ্বসভ্যতা', 13),
+(9, 'বিজ্ঞান', 11),
+(9, 'বৌদ্ধধর্ম শিক্ষা', 11),
+(9, 'ব্যবসায় উদ্যোগ', 12),
+(9, 'ভূগোল ও পরিবেশ', 15),
+(9, 'রসায়ন', 12),
+(9, 'শারীরিক শিক্ষা, স্বাস্থ্যবিজ্ঞান ও খেলাধুলা', 10),
+(9, 'সংগীত', 7),
+(9, 'সংস্কৃত', 39),
+(9, 'হিন্দুধর্ম শিক্ষা', 11),
+(9, 'হিসাববিজ্ঞান', 12);
+
+-- Class 10
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(10, 'English For Today', 16),
+(10, 'English Grammar and Composition', 21),
+(10, 'অর্থনীতি', 10),
+(10, 'আরবি', 58),
+(10, 'ইসলাম শিক্ষা', 92),
+(10, 'উচ্চতর গণিত', 14),
+(10, 'কৃষিশিক্ষা', 7),
+(10, 'ক্যারিয়ার শিক্ষা', 4),
+(10, 'খ্রিষ্টধর্ম শিক্ষা', 15),
+(10, 'গণিত', 17),
+(10, 'গার্হস্থ্যবিজ্ঞান', 18),
+(10, 'চারু ও কারুকলা', 7),
+(10, 'জীববিজ্ঞান', 14),
+(10, 'তথ্য ও যোগাযোগ প্রযুক্তি', 6),
+(10, 'পদার্থবিজ্ঞান', 13),
+(10, 'পালি', 15),
+(10, 'পৌরনীতি ও নাগরিকতা', 10),
+(10, 'ফিন্যান্স ও ব্যাংকিং', 13),
+(10, 'বাংলা ভাষার ব্যাকরণ ও নির্মিতি', 83),
+(10, 'বাংলা সহপাঠ', 8),
+(10, 'বাংলা সাহিত্য', 50),
+(10, 'বাংলাদেশ ও বিশ্বপরিচয়', 15),
+(10, 'বাংলাদেশের ইতিহাস ও বিশ্বসভ্যতা', 13),
+(10, 'বিজ্ঞান', 11),
+(10, 'বৌদ্ধধর্ম শিক্ষা', 11),
+(10, 'ব্যবসায় উদ্যোগ', 12),
+(10, 'ভূগোল ও পরিবেশ', 15),
+(10, 'রসায়ন', 12),
+(10, 'শারীরিক শিক্ষা, স্বাস্থ্যবিজ্ঞান ও খেলাধুলা', 10),
+(10, 'সংগীত', 7),
+(10, 'সংস্কৃত', 39),
+(10, 'হিন্দুধর্ম শিক্ষা', 11),
+(10, 'হিসাববিজ্ঞান', 12);
+
+-- Class 11
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(11, 'অর্থনীতি দ্বিতীয় পত্র', 3),
+(11, 'অর্থনীতি প্রথম পত্র', 3),
+(11, 'ইংরেজি দ্বিতীয় পত্র', 3),
+(11, 'ইংরেজি প্রথম পত্র', 3),
+(11, 'ইসলাম শিক্ষা দ্বিতীয় পত্র', 3),
+(11, 'ইসলাম শিক্ষা প্রথম পত্র', 3),
+(11, 'ইসলামের ইতিহাস ও সংস্কৃতি দ্বিতীয় পত্র', 3),
+(11, 'ইসলামের ইতিহাস ও সংস্কৃতি প্রথম পত্র', 3),
+(11, 'উচ্চতর গণিত দ্বিতীয় পত্র', 3),
+(11, 'উচ্চতর গণিত প্রথম পত্র', 3),
+(11, 'উৎপাদন ব্যবস্থাপনা ও বিপণন দ্বিতীয় পত্র', 3),
+(11, 'উৎপাদন ব্যবস্থাপনা ও বিপণন প্রথম পত্র', 3),
+(11, 'জীববিজ্ঞান দ্বিতীয় পত্র', 3),
+(11, 'জীববিজ্ঞান প্রথম পত্র', 3),
+(11, 'তথ্য ও যোগাযোগ প্রযুক্তি', 3),
+(11, 'পদার্থ বিদ্যা দ্বিতীয় পত্র', 3),
+(11, 'পদার্থ বিদ্যা প্রথম পত্র', 3),
+(11, 'পৌরনীতি ও সুশাসন দ্বিতীয় পত্র', 3),
+(11, 'পৌরনীতি ও সুশাসন প্রথম পত্র', 3),
+(11, 'ফিন্যান্স, ব্যাংকিং ও বীমা দ্বিতীয় পত্র', 3),
+(11, 'ফিন্যান্স, ব্যাংকিং ও বীমা প্রথম পত্র', 3),
+(11, 'বাংলা দ্বিতীয় পত্র', 3),
+(11, 'বাংলা প্রথম পত্র', 3),
+(11, 'ব্যবসায় সংগঠন ও ব্যবস্থাপনা দ্বিতীয় পত্র', 3),
+(11, 'ব্যবসায় সংগঠন ও ব্যবস্থাপনা প্রথম পত্র', 3),
+(11, 'রসায়ন দ্বিতীয় পত্র', 3),
+(11, 'রসায়ন প্রথম পত্র', 3),
+(11, 'সমাজকর্ম দ্বিতীয় পত্র', 3),
+(11, 'সমাজকর্ম প্রথম পত্র', 3),
+(11, 'হিসাববিজ্ঞান দ্বিতীয় পত্র', 3),
+(11, 'হিসাববিজ্ঞান প্রথম পত্র', 3);
+
+-- Class 12
+INSERT INTO mentor.chapters (class, subject, total_chapters) VALUES
+(12, 'অর্থনীতি দ্বিতীয় পত্র', 3),
+(12, 'অর্থনীতি প্রথম পত্র', 3),
+(12, 'ইংরেজি দ্বিতীয় পত্র', 3),
+(12, 'ইংরেজি প্রথম পত্র', 3),
+(12, 'ইসলাম শিক্ষা দ্বিতীয় পত্র', 3),
+(12, 'ইসলাম শিক্ষা প্রথম পত্র', 3),
+(12, 'ইসলামের ইতিহাস ও সংস্কৃতি দ্বিতীয় পত্র', 3),
+(12, 'ইসলামের ইতিহাস ও সংস্কৃতি প্রথম পত্র', 3),
+(12, 'উচ্চতর গণিত দ্বিতীয় পত্র', 3),
+(12, 'উচ্চতর গণিত প্রথম পত্র', 3),
+(12, 'উৎপাদন ব্যবস্থাপনা ও বিপণন দ্বিতীয় পত্র', 3),
+(12, 'উৎপাদন ব্যবস্থাপনা ও বিপণন প্রথম পত্র', 3),
+(12, 'জীববিজ্ঞান দ্বিতীয় পত্র', 3),
+(12, 'জীববিজ্ঞান প্রথম পত্র', 3),
+(12, 'তথ্য ও যোগাযোগ প্রযুক্তি', 3),
+(12, 'পদার্থ বিদ্যা দ্বিতীয় পত্র', 3),
+(12, 'পদার্থ বিদ্যা প্রথম পত্র', 3),
+(12, 'পৌরনীতি ও সুশাসন দ্বিতীয় পত্র', 3),
+(12, 'পৌরনীতি ও সুশাসন প্রথম পত্র', 3),
+(12, 'ফিন্যান্স, ব্যাংকিং ও বীমা দ্বিতীয় পত্র', 3),
+(12, 'ফিন্যান্স, ব্যাংকিং ও বীমা প্রথম পত্র', 3),
+(12, 'বাংলা দ্বিতীয় পত্র', 3),
+(12, 'বাংলা প্রথম পত্র', 3),
+(12, 'ব্যবসায় সংগঠন ও ব্যবস্থাপনা দ্বিতীয় পত্র', 3),
+(12, 'ব্যবসায় সংগঠন ও ব্যবস্থাপনা প্রথম পত্র', 3),
+(12, 'রসায়ন দ্বিতীয় পত্র', 3),
+(12, 'রসায়ন প্রথম পত্র', 3),
+(12, 'সমাজকর্ম দ্বিতীয় পত্র', 3),
+(12, 'সমাজকর্ম প্রথম পত্র', 3),
+(12, 'হিসাববিজ্ঞান দ্বিতীয় পত্র', 3),
+(12, 'হিসাববিজ্ঞান প্রথম পত্র', 3);
+
+-- Done! Now delete existing test subscriptions and add new ones
