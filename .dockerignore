@@ -1,0 +1,13 @@
+# Ignore SQL files - they're for database setup, not the Go app
+*.sql
+
+# Ignore Fly.io config
+fly.toml
+
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
