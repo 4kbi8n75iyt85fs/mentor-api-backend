@@ -1,11 +1,9 @@
-FROM golang:1.21-alpine
-
-# Install git for fetching dependencies
-RUN apk add --no-cache git
+# Build stage
+FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-# Copy go mod files first for caching
+# Copy go mod files
 COPY go.mod go.sum ./
 
 # Download dependencies
@@ -15,10 +13,20 @@ RUN go mod download
 COPY main.go ./
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
+RUN CGO_ENABLED=0 GOOS=linux go build -o main .
+
+# Run stage
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /root/
+
+# Copy binary from builder
+COPY --from=builder /app/main .
 
 # Expose port
 EXPOSE 3001
 
-# Run the binary
+# Run
 CMD ["./main"]
