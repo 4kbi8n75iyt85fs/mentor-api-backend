@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -77,6 +78,15 @@ func main() {
 
 		// Teacher's today schedule (V2)
 		api.GET("/teacher/:teacherId/today", getTeacherTodayV2)
+
+		// Content Management endpoints
+		api.GET("/content", getContentList)
+		api.GET("/content/:class/:subject/:chapter", getContent)
+		api.POST("/content", upsertContent)
+		api.DELETE("/content/:class/:subject/:chapter", deleteContent)
+
+		// Chapters lookup
+		api.GET("/chapters", getChapters)
 	}
 
 	r.GET("/health", func(c *gin.Context) {
@@ -139,7 +149,7 @@ func login(c *gin.Context) {
 // ============================================
 func getSubscriptions(c *gin.Context) {
 	teacherId := c.Query("teacher_id")
-	
+
 	query := `
 		SELECT id, student_name, student_phone, guardian_name, guardian_phone,
 		       class, subjects, teacher_id, days_per_week, schedule_days, time,
@@ -148,7 +158,7 @@ func getSubscriptions(c *gin.Context) {
 		WHERE status = 'active'
 	`
 	args := []interface{}{}
-	
+
 	if teacherId != "" {
 		query += " AND teacher_id = $1"
 		args = append(args, teacherId)
@@ -355,7 +365,6 @@ func createSubscription(c *gin.Context) {
 	}
 	log.Printf("CreateSubscription debug: %v, total=%d", debugInfo, totalClasses)
 
-
 	// Insert subscription
 	var subId int
 	err := db.QueryRow(`
@@ -390,7 +399,7 @@ func createSubscription(c *gin.Context) {
 		if chapters == 0 {
 			chapters = 15 // Default
 		}
-		
+
 		// Simple: 1 chapter = 1 class/part
 		db.Exec(`
 			INSERT INTO mentor.schedule (subscription_id, subject, total_parts_needed)
@@ -492,7 +501,7 @@ func deleteSubscription(c *gin.Context) {
 	// Delete related records first
 	db.Exec("DELETE FROM mentor.progress WHERE subscription_id = $1", id)
 	db.Exec("DELETE FROM mentor.schedule WHERE subscription_id = $1", id)
-	
+
 	_, err := db.Exec("DELETE FROM mentor.subscriptions WHERE id = $1", id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
@@ -638,7 +647,7 @@ func getProgress(c *gin.Context) {
 func getTeacherTodayV2(c *gin.Context) {
 	teacherId := c.Param("teacherId")
 	todayName := getDayName() // "Mon", "Tue", etc.
-	
+
 	// Map day names to codes: Sun=2, Mon=3, Tue=4, Wed=5, Thu=6, Fri=7, Sat=1
 	dayNameToCode := map[string]string{
 		"Sat": "1", "Sun": "2", "Mon": "3", "Tue": "4",
@@ -762,7 +771,7 @@ func getSchedule(c *gin.Context) {
 func getTodaySchedule(c *gin.Context) {
 	teacherId := c.Param("teacherId")
 	todayName := getDayName()
-	
+
 	// Map day names to codes: Sun=2, Mon=3, Tue=4, Wed=5, Thu=6, Fri=7, Sat=1
 	dayNameToCode := map[string]string{
 		"Sat": "1", "Sun": "2", "Mon": "3", "Tue": "4",
@@ -795,20 +804,19 @@ func getTodaySchedule(c *gin.Context) {
 	`, teacherId, "%"+todayName+"%", "%"+todayCode+"%")
 	defer rows.Close()
 
-
 	var schedules []gin.H
 	for rows.Next() {
 		var id, class, totalClasses, completedClasses int
 		var studentName, subjects, scheduleDays, schedTime, scheduleJSON string
 		var progressPercent float64
 
-		rows.Scan(&id, &studentName, &class, &subjects, &scheduleDays, &schedTime, 
+		rows.Scan(&id, &studentName, &class, &subjects, &scheduleDays, &schedTime,
 			&totalClasses, &completedClasses, &progressPercent, &scheduleJSON)
 
 		// Find today's class from schedule_json
 		var currentChapter, currentPart int = 1, 1
 		var todaySubject string
-		
+
 		// Parse schedule_json to find today's lesson
 		// For now, use first subject and get from schedule table
 		db.QueryRow(`
@@ -1020,4 +1028,204 @@ func deleteTeacher(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Teacher deleted"})
+}
+
+// ============================================
+// CONTENT MANAGEMENT
+// ============================================
+
+func getChapters(c *gin.Context) {
+	classNum := c.Query("class")
+
+	var rows *sql.Rows
+	var err error
+
+	if classNum != "" {
+		rows, err = db.Query(`
+			SELECT class, subject, total_chapters
+			FROM mentor.chapters WHERE class = $1
+			ORDER BY subject
+		`, classNum)
+	} else {
+		rows, err = db.Query(`
+			SELECT class, subject, total_chapters
+			FROM mentor.chapters
+			ORDER BY class, subject
+		`)
+	}
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var chapters []gin.H
+	for rows.Next() {
+		var class, totalChapters int
+		var subject string
+		rows.Scan(&class, &subject, &totalChapters)
+		chapters = append(chapters, gin.H{
+			"class":          class,
+			"subject":        subject,
+			"total_chapters": totalChapters,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "chapters": chapters})
+}
+
+func getContentList(c *gin.Context) {
+	classNum := c.Query("class")
+	subject := c.Query("subject")
+
+	query := `SELECT id, class, subject, chapter_number, chapter_title, created_at, updated_at
+			  FROM mentor.content WHERE 1=1`
+	args := []interface{}{}
+	argCount := 0
+
+	if classNum != "" {
+		argCount++
+		query += fmt.Sprintf(" AND class = $%d", argCount)
+		args = append(args, classNum)
+	}
+	if subject != "" {
+		argCount++
+		query += fmt.Sprintf(" AND subject = $%d", argCount)
+		args = append(args, subject)
+	}
+	query += " ORDER BY class, subject, chapter_number"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var content []gin.H
+	for rows.Next() {
+		var id, class, chapterNum int
+		var subject, chapterTitle string
+		var createdAt, updatedAt time.Time
+		var chapterTitleNull sql.NullString
+
+		rows.Scan(&id, &class, &subject, &chapterNum, &chapterTitleNull, &createdAt, &updatedAt)
+
+		if chapterTitleNull.Valid {
+			chapterTitle = chapterTitleNull.String
+		}
+
+		content = append(content, gin.H{
+			"id":             id,
+			"class":          class,
+			"subject":        subject,
+			"chapter_number": chapterNum,
+			"chapter_title":  chapterTitle,
+			"created_at":     createdAt.Format("2006-01-02 15:04"),
+			"updated_at":     updatedAt.Format("2006-01-02 15:04"),
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "content": content})
+}
+
+func getContent(c *gin.Context) {
+	classNum := c.Param("class")
+	subject := c.Param("subject")
+	chapter := c.Param("chapter")
+
+	var id, class, chapterNum int
+	var subjectName, chapterTitle string
+	var contentJSON string
+	var chapterTitleNull sql.NullString
+
+	err := db.QueryRow(`
+		SELECT id, class, subject, chapter_number, chapter_title, content_json::text
+		FROM mentor.content
+		WHERE class = $1 AND subject = $2 AND chapter_number = $3
+	`, classNum, subject, chapter).Scan(&id, &class, &subjectName, &chapterNum, &chapterTitleNull, &contentJSON)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusOK, gin.H{"success": true, "content": nil})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if chapterTitleNull.Valid {
+		chapterTitle = chapterTitleNull.String
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"content": gin.H{
+			"id":             id,
+			"class":          class,
+			"subject":        subjectName,
+			"chapter_number": chapterNum,
+			"chapter_title":  chapterTitle,
+			"content_json":   gin.H{"raw": contentJSON},
+		},
+	})
+}
+
+func upsertContent(c *gin.Context) {
+	var input struct {
+		Class         int         `json:"class"`
+		Subject       string      `json:"subject"`
+		ChapterNumber int         `json:"chapter_number"`
+		ChapterTitle  string      `json:"chapter_title"`
+		ContentJSON   interface{} `json:"content_json"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Convert content to JSON string
+	contentBytes, err := json.Marshal(input.ContentJSON)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid content JSON"})
+		return
+	}
+
+	// Upsert (insert or update on conflict)
+	_, err = db.Exec(`
+		INSERT INTO mentor.content (class, subject, chapter_number, chapter_title, content_json)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (class, subject, chapter_number) 
+		DO UPDATE SET 
+			chapter_title = EXCLUDED.chapter_title,
+			content_json = EXCLUDED.content_json,
+			updated_at = NOW()
+	`, input.Class, input.Subject, input.ChapterNumber, input.ChapterTitle, string(contentBytes))
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Content saved"})
+}
+
+func deleteContent(c *gin.Context) {
+	classNum := c.Param("class")
+	subject := c.Param("subject")
+	chapter := c.Param("chapter")
+
+	_, err := db.Exec(`
+		DELETE FROM mentor.content 
+		WHERE class = $1 AND subject = $2 AND chapter_number = $3
+	`, classNum, subject, chapter)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Content deleted"})
 }
