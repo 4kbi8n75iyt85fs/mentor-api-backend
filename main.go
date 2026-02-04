@@ -966,7 +966,6 @@ func getTeacher(c *gin.Context) {
 
 func createTeacher(c *gin.Context) {
 	var req struct {
-		ID       string `json:"id"`
 		Name     string `json:"name"`
 		Phone    string `json:"phone"`
 		Password string `json:"password"`
@@ -977,17 +976,22 @@ func createTeacher(c *gin.Context) {
 		return
 	}
 
+	// Auto-generate teacher ID starting from 1001
+	var maxID int
+	db.QueryRow(`SELECT COALESCE(MAX(CAST(id AS INTEGER)), 1000) FROM mentor.teachers WHERE id ~ '^[0-9]+$'`).Scan(&maxID)
+	newID := strconv.Itoa(maxID + 1)
+
 	_, err := db.Exec(`
 		INSERT INTO mentor.teachers (id, name, phone, password)
 		VALUES ($1, $2, $3, $4)
-	`, req.ID, req.Name, req.Phone, req.Password)
+	`, newID, req.Name, req.Phone, req.Password)
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Teacher created"})
+	c.JSON(http.StatusOK, gin.H{"success": true, "id": newID, "message": "Teacher created"})
 }
 
 func updateTeacher(c *gin.Context) {
