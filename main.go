@@ -1671,8 +1671,12 @@ func submitExamForGrading(c *gin.Context) {
 }
 
 func gradeWithGemini(questionText, imageBase64, subject string) (int, string, string, error) {
-	if geminiAPIKey == "" {
-		return 0, "", "", fmt.Errorf("GEMINI_API_KEY not configured")
+	// Use Groq API with llama-3.2-vision for better rate limits (30 req/min FREE)
+	groqAPIKey := os.Getenv("GROQ_API_KEY")
+	
+	// Fallback to Gemini if Groq not configured
+	if groqAPIKey == "" {
+		return gradeWithGeminiDirect(questionText, imageBase64, subject)
 	}
 
 	// Prepare prompt for grading
@@ -1685,7 +1689,7 @@ Please analyze this handwritten answer paper image and provide:
 
 %s
 
-IMPORTANT: Respond in this exact JSON format:
+IMPORTANT: Respond in this exact JSON format only:
 {
   "score": <number 0-100>,
   "feedback": "<what was done well>",
@@ -1697,7 +1701,118 @@ IMPORTANT: Respond in this exact JSON format:
 		return "No specific question was provided, evaluate the answer based on the content visible."
 	}())
 
-	// Call Gemini API - using 2.0 Flash for best free handwriting recognition
+	// Call Groq API with llama-3.2-90b-vision-preview
+	apiURL := "https://api.groq.com/openai/v1/chat/completions"
+
+	requestBody := map[string]interface{}{
+		"model": "llama-3.2-90b-vision-preview",
+		"messages": []map[string]interface{}{
+			{
+				"role": "user",
+				"content": []map[string]interface{}{
+					{"type": "text", "text": prompt},
+					{
+						"type": "image_url",
+						"image_url": map[string]string{
+							"url": "data:image/jpeg;base64," + imageBase64,
+						},
+					},
+				},
+			},
+		},
+		"temperature": 0.2,
+		"max_tokens":  1024,
+	}
+
+	jsonBody, _ := json.Marshal(requestBody)
+	
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return 0, "", "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+groqAPIKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", "", err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 {
+		// If Groq fails, try Gemini as fallback
+		log.Printf("Groq API error: %s, falling back to Gemini", string(body))
+		return gradeWithGeminiDirect(questionText, imageBase64, subject)
+	}
+
+	// Parse Groq/OpenAI response format
+	var groqResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	json.Unmarshal(body, &groqResp)
+
+	if len(groqResp.Choices) == 0 {
+		return 0, "", "", fmt.Errorf("empty response from Groq")
+	}
+
+	responseText := groqResp.Choices[0].Message.Content
+
+	// Extract JSON from response (handle markdown code blocks)
+	jsonStart := strings.Index(responseText, "{")
+	jsonEnd := strings.LastIndex(responseText, "}")
+	if jsonStart == -1 || jsonEnd == -1 {
+		return 0, "", "", fmt.Errorf("could not parse Groq response: %s", responseText)
+	}
+	jsonStr := responseText[jsonStart : jsonEnd+1]
+
+	var gradeResult struct {
+		Score       int    `json:"score"`
+		Feedback    string `json:"feedback"`
+		Suggestions string `json:"suggestions"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &gradeResult); err != nil {
+		return 0, "", "", fmt.Errorf("invalid JSON from Groq: %s", jsonStr)
+	}
+
+	return gradeResult.Score, gradeResult.Feedback, gradeResult.Suggestions, nil
+}
+
+// gradeWithGeminiDirect - fallback to Gemini if Groq not configured
+func gradeWithGeminiDirect(questionText, imageBase64, subject string) (int, string, string, error) {
+	if geminiAPIKey == "" {
+		return 0, "", "", fmt.Errorf("No AI API key configured (GROQ_API_KEY or GEMINI_API_KEY required)")
+	}
+
+	// Prepare prompt for grading
+	prompt := fmt.Sprintf(`You are an expert teacher grading a student's answer paper for the subject: %s
+
+Please analyze this handwritten answer paper image and provide:
+1. A score from 0 to 100
+2. Feedback on what the student did well
+3. Specific suggestions for improvement
+
+%s
+
+IMPORTANT: Respond in this exact JSON format only:
+{
+  "score": <number 0-100>,
+  "feedback": "<what was done well>",
+  "suggestions": "<specific improvement suggestions>"
+}`, subject, func() string {
+		if questionText != "" {
+			return fmt.Sprintf("The question being answered was: %s", questionText)
+		}
+		return "No specific question was provided, evaluate the answer based on the content visible."
+	}())
+
+	// Call Gemini API
 	apiURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + geminiAPIKey
 
 	requestBody := map[string]interface{}{
@@ -1715,7 +1830,7 @@ IMPORTANT: Respond in this exact JSON format:
 			},
 		},
 		"generationConfig": map[string]interface{}{
-			"temperature": 0.2,
+			"temperature":     0.2,
 			"maxOutputTokens": 1024,
 		},
 	}
