@@ -1173,16 +1173,23 @@ func getContent(c *gin.Context) {
 		chapterTitle = chapterTitleNull.String
 	}
 
+	// Parse the content_json string into actual JSON
+	var parsedContent map[string]interface{}
+	if err := json.Unmarshal([]byte(contentJSON), &parsedContent); err != nil {
+		// If parsing fails, return empty sections
+		parsedContent = map[string]interface{}{"sections": []interface{}{}}
+	}
+
+	// Merge parsed content with metadata
+	parsedContent["id"] = id
+	parsedContent["class"] = class
+	parsedContent["subject"] = subjectName
+	parsedContent["chapter_number"] = chapterNum
+	parsedContent["chapter_title"] = chapterTitle
+
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"content": gin.H{
-			"id":             id,
-			"class":          class,
-			"subject":        subjectName,
-			"chapter_number": chapterNum,
-			"chapter_title":  chapterTitle,
-			"content_json":   gin.H{"raw": contentJSON},
-		},
+		"content": parsedContent,
 	})
 }
 
